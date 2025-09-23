@@ -1,0 +1,15 @@
+[project]
+name = "posture-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mediapipe>=0.10.21",
+    "numpy>=1.26.4",
+    "onnxruntime>=1.22.1",
+    "opencv-python>=4.11.0.86",
+    "pyqt6>=6.9.1",
+    "gtts>=2.5.1",
+    "pygame>=2.5.2",
+]

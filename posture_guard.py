@@ -1,46 +1,28 @@
 from __future__ import annotations
-"""
-Side‑View Posture Guard — Local Desktop App
 
-Modern PyQt6 desktop app that runs entirely on-device to watch your posture
-from a SIDE camera view. If it detects a slouch/bad posture, it shows a big
-warning, plays a sound, and (optionally) speaks a reminder.
-
-Backends supported:
-  1) ONNX classification model (e.g., outputs [good, bad])
-  2) Ultralytics YOLOv8/v5 .pt detector (pip install ultralytics)
-  3) OpenCV DNN YOLO (.cfg + .weights) detector (your case — YOLOv3)
-  4) Fallback heuristic (no model): uses MediaPipe Pose to estimate angles
-
-Everything runs locally.
-"""
-import os
-import sys
-import time
 import math
-import threading
+import os
 import queue
 import shutil
+import sys
+import threading
+import time
 from collections import deque
 from typing import List, Optional
 
-import numpy as np
 import cv2
-
+import numpy as np
+from mediapipe.python.solutions.pose import Pose as mp_pose
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
-# Required MediaPipe for pose detection
-try:
-    from mediapipe.python.solutions.pose import Pose as mp_pose
-except Exception:
-    raise RuntimeError("MediaPipe is required. Install with: pip install mediapipe")
-
 # Universal TTS with better voice quality
 try:
-    from gtts import gTTS
-    import pygame
     import tempfile
+
+    import pygame
+    from gtts import gTTS
+
     TTS_AVAILABLE = True
 except Exception as e:
     print(f"TTS imports failed: {e}")
@@ -54,28 +36,51 @@ except Exception as e:
 # Utility helpers
 # ------------------------
 
-# Removed load_names function - using default labels only
 
-
-def draw_text(img, text, org, scale=0.9, thickness=2, color=(255, 255, 255), bg=(0, 0, 0)):
+def draw_text(
+    img, text, org, scale=0.9, thickness=2, color=(255, 255, 255), bg=(0, 0, 0)
+):
     (w, h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
     x, y = org
     cv2.rectangle(img, (x, y - h - baseline - 6), (x + w + 6, y + 6), bg, -1)
-    cv2.putText(img, text, (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        text,
+        (x + 3, y - 3),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
-def centered_text(img, text, scale=1.2, thickness=3, color=(255, 255, 255), bg=(0, 0, 0)):
+def centered_text(
+    img, text, scale=1.2, thickness=3, color=(255, 255, 255), bg=(0, 0, 0)
+):
     h, w = img.shape[:2]
-    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    (tw, th), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+    )
     x = (w - tw) // 2
     y = (h + th) // 2
     cv2.rectangle(img, (x - 10, y - th - baseline - 10), (x + tw + 10, y + 10), bg, -1)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 # ------------------------
 # Inference backends
 # ------------------------
+
 
 class BaseBackend:
     def __init__(self, labels: List[str]):
@@ -89,44 +94,53 @@ class BaseBackend:
         del frame_bgr, extras  # Mark as intentionally unused
 
 
-# Removed unused model backends - using MediaPipe only
-
-
 class HeuristicPoseBackend(BaseBackend):
     """No model required – uses MediaPipe Pose to estimate angle between ear-shoulder-hip.
     If head/torso angle exceeds threshold, marks as bad.
     """
+
     def __init__(self, labels: List[str], angle_threshold_deg: float = 15.0):
         super().__init__(labels)
         if mp_pose is None:
             raise RuntimeError("mediapipe not installed. pip install mediapipe")
-        self.pose = mp_pose(static_image_mode=False, model_complexity=1, enable_segmentation=False)
-        self.angle_threshold = angle_threshold_deg  # Increased from 25 to 35 for better sensitivity
+        self.pose = mp_pose(
+            static_image_mode=False, model_complexity=1, enable_segmentation=False
+        )
+        self.angle_threshold = (
+            angle_threshold_deg  # Increased from 25 to 35 for better sensitivity
+        )
         self.last_landmarks = None
         self.smoothing_buffer = deque(maxlen=5)  # Add smoothing buffer for stability
 
     def inference(self, frame_bgr: np.ndarray):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self.pose.process(rgb)
-        if not hasattr(res, 'pose_landmarks') or getattr(res, 'pose_landmarks', None) is None:
+        if (
+            not hasattr(res, "pose_landmarks")
+            or getattr(res, "pose_landmarks", None) is None
+        ):
             return "unknown", 0.0, {}
-        lm = getattr(res, 'pose_landmarks').landmark
+        lm = getattr(res, "pose_landmarks").landmark
         self.last_landmarks = lm
         # Right side landmarks (camera side). If mirrored, either side works.
-        ear = np.array([lm[8].x, lm[8].y])   # Right ear
+        ear = np.array([lm[8].x, lm[8].y])  # Right ear
         shoulder = np.array([lm[12].x, lm[12].y])  # Right shoulder
         hip = np.array([lm[24].x, lm[24].y])  # Right hip
         # Calculate forward head posture using multiple metrics
         # 1. Angle at shoulder between ear-shoulder and hip-shoulder
         v1 = ear - shoulder
         v2 = hip - shoulder
+
         def angle(a, b):
             cosang = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6)
             return math.degrees(math.acos(np.clip(cosang, -1, 1)))
+
         shoulder_angle = angle(v1, v2)
 
         # 2. Forward head position (ear x-coordinate relative to shoulder)
-        head_forward_ratio = abs(ear[0] - shoulder[0]) / abs(hip[0] - shoulder[0] + 1e-6)
+        head_forward_ratio = abs(ear[0] - shoulder[0]) / abs(
+            hip[0] - shoulder[0] + 1e-6
+        )
 
         # Proper posture guidelines:
         # Neutral alignment: 165-180°
@@ -136,21 +150,27 @@ class HeuristicPoseBackend(BaseBackend):
         forward_bad = head_forward_ratio > 0.15  # Head significantly forward
 
         # Use smoothing buffer for stability
-        combined_bad_score = (angle_bad * 0.8) + (forward_bad * 0.2)  # Angle primary, forward secondary
+        combined_bad_score = (angle_bad * 0.8) + (
+            forward_bad * 0.2
+        )  # Angle primary, forward secondary
         self.smoothing_buffer.append(combined_bad_score)
         avg_bad_score = sum(self.smoothing_buffer) / len(self.smoothing_buffer)
 
         bad = avg_bad_score > 0.6  # Clear threshold for bad posture
 
         # Debug output to track angles
-        if hasattr(self, '_debug_frame_count'):
+        if hasattr(self, "_debug_frame_count"):
             self._debug_frame_count += 1
         else:
             self._debug_frame_count = 0
 
         if self._debug_frame_count % 30 == 0:  # Every 30 frames (~1 second)
-            posture_status = "BAD" if bad else ("MILD" if shoulder_angle < 165 else "GOOD")
-            print(f"📐 Angle: {shoulder_angle:.1f}° ({posture_status}), Forward: {head_forward_ratio:.3f}, Score: {avg_bad_score:.3f}")
+            posture_status = (
+                "BAD" if bad else ("MILD" if shoulder_angle < 165 else "GOOD")
+            )
+            print(
+                f"📐 Angle: {shoulder_angle:.1f}° ({posture_status}), Forward: {head_forward_ratio:.3f}, Score: {avg_bad_score:.3f}"
+            )
         label = "bad" if bad else "good"
         conf = min(1.0, avg_bad_score) if bad else max(0.7, 1.0 - avg_bad_score)
 
@@ -160,7 +180,7 @@ class HeuristicPoseBackend(BaseBackend):
             "landmarks": lm,
             "bad_score": avg_bad_score,
             "angle_bad": angle_bad,
-            "forward_bad": forward_bad
+            "forward_bad": forward_bad,
         }
         return label, conf, extras
 
@@ -172,7 +192,9 @@ class HeuristicPoseBackend(BaseBackend):
         if not lm:
             return
         # Draw key points
-        pts = [(int(l.x * w), int(l.y * h)) for l in (lm[8], lm[12], lm[24])]  # ear, shoulder, hip
+        pts = [
+            (int(l.x * w), int(l.y * h)) for l in (lm[8], lm[12], lm[24])
+        ]  # ear, shoulder, hip
         for p in pts:
             cv2.circle(frame_bgr, p, 6, (0, 255, 255), -1)
         # Lines
@@ -185,6 +207,7 @@ class HeuristicPoseBackend(BaseBackend):
 # ------------------------
 # Video worker thread
 # ------------------------
+
 
 class VideoThread(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(np.ndarray, str, float, dict)
@@ -227,12 +250,18 @@ class VideoThread(QtCore.QThread):
             if self.backend is not None:
                 label, conf, extras = self.backend.inference(frame)
                 self.bad_smoothing.append(1 if label.lower().startswith("bad") else 0)
-                bad_ratio = sum(self.bad_smoothing) / len(self.bad_smoothing) if self.bad_smoothing else 0.0
+                bad_ratio = (
+                    sum(self.bad_smoothing) / len(self.bad_smoothing)
+                    if self.bad_smoothing
+                    else 0.0
+                )
                 # Draw guidance overlay (side-view guide)
                 overlay = frame.copy()
                 h, w = frame.shape[:2]
                 # Guide line in the middle where ear-shoulder-hip should roughly align vertically
-                cv2.line(overlay, (int(w*0.33), 0), (int(w*0.33), h), (100, 100, 100), 2)
+                cv2.line(
+                    overlay, (int(w * 0.33), 0), (int(w * 0.33), h), (100, 100, 100), 2
+                )
                 alpha = 0.15
                 frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
                 # Let backend add annotations
@@ -240,7 +269,12 @@ class VideoThread(QtCore.QThread):
                     self.backend.draw(frame, extras)
                 except Exception:
                     pass
-                self.frame_ready.emit(frame, label, float(conf if isinstance(conf, (int, float)) else 0.0), {"bad_ratio": bad_ratio, "extras": extras})
+                self.frame_ready.emit(
+                    frame,
+                    label,
+                    float(conf if isinstance(conf, (int, float)) else 0.0),
+                    {"bad_ratio": bad_ratio, "extras": extras},
+                )
             else:
                 self.frame_ready.emit(frame, "unknown", 0.0, {"bad_ratio": 0.0})
         if self.cap is not None:
@@ -251,7 +285,9 @@ class VideoThread(QtCore.QThread):
         try:
             if self.cap is not None:
                 self.cap.release()
-            self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+            self.cap = cv2.VideoCapture(
+                self.cam_index, cv2.CAP_DSHOW if os.name == "nt" else 0
+            )
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             # Test if camera is working
@@ -279,6 +315,7 @@ class VideoThread(QtCore.QThread):
 # ------------------------
 # Settings Dialog
 # ------------------------
+
 
 class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
@@ -448,7 +485,9 @@ class SettingsDialog(QtWidgets.QDialog):
         new_voice_delay = self.voice_delay_spinbox.value()
         if new_voice_delay != self.original_voice_delay:
             self.parent_app.voice_trigger_delay = new_voice_delay
-            self.parent_app.log_msg(f"Voice trigger delay set: {new_voice_delay:.1f} seconds")
+            self.parent_app.log_msg(
+                f"Voice trigger delay set: {new_voice_delay:.1f} seconds"
+            )
             # Reset bad posture timing when delay changes
             self.parent_app.bad_posture_start_time = None
             self.parent_app.bad_posture_accumulated_time = 0.0
@@ -463,6 +502,7 @@ class SettingsDialog(QtWidgets.QDialog):
 # ------------------------
 # Main UI
 # ------------------------
+
 
 class PostureApp(QtWidgets.QMainWindow):
     def __init__(self):
@@ -516,8 +556,6 @@ class PostureApp(QtWidgets.QMainWindow):
         self.worker.set_backend(self.backend)
         self.log_msg("Using MediaPipe pose detection (default)")
 
-        # State (duplicate removed)
-
     # ---------- UI ----------
     def _build_ui(self):
         central = QtWidgets.QWidget()
@@ -554,17 +592,21 @@ class PostureApp(QtWidgets.QMainWindow):
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
-        self.log.setStyleSheet("background:#0e0e10;color:#d7d7db;border-radius:12px;padding:8px;")
+        self.log.setStyleSheet(
+            "background:#0e0e10;color:#d7d7db;border-radius:12px;padding:8px;"
+        )
         self.log.setPlaceholderText("Logs will appear here…")
 
-        layout_widget = vstack([
-            self.video_label,
-            hstack([QtWidgets.QLabel("Status:"), self.status_chip, stretch()]),
-            buttons,
-            QtWidgets.QLabel("Activity log"),
-            self.log,
-            stretch(),
-        ])
+        layout_widget = vstack(
+            [
+                self.video_label,
+                hstack([QtWidgets.QLabel("Status:"), self.status_chip, stretch()]),
+                buttons,
+                QtWidgets.QLabel("Activity log"),
+                self.log,
+                stretch(),
+            ]
+        )
         layout = layout_widget.layout()
         if layout is not None:
             layout.setContentsMargins(16, 16, 16, 16)
@@ -583,8 +625,6 @@ class PostureApp(QtWidgets.QMainWindow):
         act_quit = QtGui.QAction("Quit", self)
         m_file.addAction(act_quit)
         act_quit.triggered.connect(self.close)
-
-        # Model menu removed - using MediaPipe only
 
         m_cam = QtWidgets.QMenu("Camera", self)
         bar.addMenu(m_cam)
@@ -619,7 +659,6 @@ class PostureApp(QtWidgets.QMainWindow):
         settings_dialog = SettingsDialog(self)
         settings_dialog.exec()
 
-
     def start_camera(self):
         if not self.worker.isRunning():
             self.worker.start()
@@ -640,16 +679,23 @@ class PostureApp(QtWidgets.QMainWindow):
                 try:
                     # Wait for speech requests with timeout
                     text = self.speech_queue.get(timeout=1.0)
-                    if text and self.tts_available and gTTS is not None and pygame is not None:
+                    if (
+                        text
+                        and self.tts_available
+                        and gTTS is not None
+                        and pygame is not None
+                    ):
                         current_time = time.time()
                         # Enforce cooldown to prevent overlapping speech
                         if current_time - self.last_speech_time >= self.speech_cooldown:
                             try:
                                 # Generate speech with Google TTS (natural female voice)
-                                tts = gTTS(text=text, lang='en', slow=False)
+                                tts = gTTS(text=text, lang="en", slow=False)
 
                                 # Create temporary file
-                                temp_file = os.path.join(self.temp_dir, f"speech_{int(current_time)}.mp3")
+                                temp_file = os.path.join(
+                                    self.temp_dir, f"speech_{int(current_time)}.mp3"
+                                )
                                 tts.save(temp_file)
 
                                 # Play the audio using pygame
@@ -720,9 +766,13 @@ class PostureApp(QtWidgets.QMainWindow):
         chip_text = f"{label.upper()}  ({conf:.2f})  •  angle: {angle:.1f}°  •  ratio: {bad_ratio:.2f}"
         self.status_chip.setText(chip_text)
         if is_bad:
-            self.status_chip.setStyleSheet("border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#c9342f;")
+            self.status_chip.setStyleSheet(
+                "border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#c9342f;"
+            )
         else:
-            self.status_chip.setStyleSheet("border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#2e7d32;")
+            self.status_chip.setStyleSheet(
+                "border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#2e7d32;"
+            )
 
         # Track bad posture with time-based accumulation
         current_bad_posture = bad_ratio >= self.min_bad_ratio
@@ -732,22 +782,35 @@ class PostureApp(QtWidgets.QMainWindow):
             # Start tracking bad posture time
             if self.bad_posture_start_time is None:
                 self.bad_posture_start_time = current_time
-                print(f"🔴 Bad posture detected! Starting timer... (ratio: {bad_ratio:.3f})")
+                print(
+                    f"🔴 Bad posture detected! Starting timer... (ratio: {bad_ratio:.3f})"
+                )
             else:
                 # Accumulate bad posture time
-                self.bad_posture_accumulated_time += current_time - self.bad_posture_start_time
+                self.bad_posture_accumulated_time += (
+                    current_time - self.bad_posture_start_time
+                )
                 self.bad_posture_start_time = current_time
 
             # Debug output every 0.5 seconds
-            if int(self.bad_posture_accumulated_time * 2) > int((self.bad_posture_accumulated_time - 0.1) * 2):
-                print(f"⏱️  Bad posture time: {self.bad_posture_accumulated_time:.1f}s / {self.voice_trigger_delay:.1f}s (voice: {self.voice_enabled}, tts: {self.tts_available})")
+            if int(self.bad_posture_accumulated_time * 2) > int(
+                (self.bad_posture_accumulated_time - 0.1) * 2
+            ):
+                print(
+                    f"⏱️  Bad posture time: {self.bad_posture_accumulated_time:.1f}s / {self.voice_trigger_delay:.1f}s (voice: {self.voice_enabled}, tts: {self.tts_available})"
+                )
 
             # Trigger voice if accumulated time exceeds threshold and enough time passed since last trigger
-            if (self.voice_enabled and self.tts_available and
-                self.bad_posture_accumulated_time >= self.voice_trigger_delay and
-                (current_time - self.last_voice_trigger_time) >= self.speech_cooldown):
-
-                print(f"🔊 TRIGGERING VOICE! Accumulated: {self.bad_posture_accumulated_time:.1f}s, Threshold: {self.voice_trigger_delay:.1f}s")
+            if (
+                self.voice_enabled
+                and self.tts_available
+                and self.bad_posture_accumulated_time >= self.voice_trigger_delay
+                and (current_time - self.last_voice_trigger_time)
+                >= self.speech_cooldown
+            ):
+                print(
+                    f"🔊 TRIGGERING VOICE! Accumulated: {self.bad_posture_accumulated_time:.1f}s, Threshold: {self.voice_trigger_delay:.1f}s"
+                )
                 self.speak("You have bad posture. Please straighten up.")
                 self.last_voice_trigger_time = current_time
                 # Reset accumulation after triggering
@@ -755,7 +818,9 @@ class PostureApp(QtWidgets.QMainWindow):
         else:
             # Reset timing when posture is good
             if self.bad_posture_start_time is not None:
-                print(f"✅ Good posture restored! Reset timer (was: {self.bad_posture_accumulated_time:.1f}s)")
+                print(
+                    f"✅ Good posture restored! Reset timer (was: {self.bad_posture_accumulated_time:.1f}s)"
+                )
             self.bad_posture_start_time = None
             self.bad_posture_accumulated_time = 0.0
 
@@ -763,7 +828,11 @@ class PostureApp(QtWidgets.QMainWindow):
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg).scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        pix = QtGui.QPixmap.fromImage(qimg).scaled(
+            self.video_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
         self.video_label.setPixmap(pix)
 
     def closeEvent(self, a0: Optional[QtGui.QCloseEvent]) -> None:
@@ -772,9 +841,13 @@ class PostureApp(QtWidgets.QMainWindow):
             # Stop speech worker
             self.speech_worker_running = False
             # Clean up pygame and temp files
-            if hasattr(self, 'tts_available') and self.tts_available and pygame is not None:
+            if (
+                hasattr(self, "tts_available")
+                and self.tts_available
+                and pygame is not None
+            ):
                 pygame.mixer.quit()
-            if hasattr(self, 'temp_dir'):
+            if hasattr(self, "temp_dir"):
                 try:
                     shutil.rmtree(self.temp_dir)
                 except OSError:
@@ -815,7 +888,9 @@ def vstack(widgets: List[QtWidgets.QWidget]) -> QtWidgets.QWidget:
 
 def stretch():
     s = QtWidgets.QWidget()
-    s.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+    s.setSizePolicy(
+        QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred
+    )
     return s
 
 
@@ -831,4 +906,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

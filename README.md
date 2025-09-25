@@ -49,11 +49,6 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Or install them manually:
-```bash
-pip install PyQt6 opencv-python mediapipe numpy pyttsx3
-```
-
 3. Run the application:
 ```bash
 python posture_guard.py

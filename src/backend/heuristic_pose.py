@@ -72,6 +72,21 @@ class HeuristicPoseBackend(BaseBackend):
 
         lm = getattr(res, "pose_landmarks").landmark
 
+        # Check if user is positioned sideways (not frontal)
+        is_side_view, side_view_info = self._validate_side_view(lm)
+
+        if not is_side_view:
+            # Return warning state when not properly positioned
+            return (
+                "unknown",
+                0.0,
+                {
+                    "side_view_warning": True,
+                    "side_view_info": side_view_info,
+                    "landmarks": lm,
+                },
+            )
+
         # Right side landmarks (camera side). If mirrored, either side works.
         ear = np.array([lm[8].x, lm[8].y])  # Right ear
         shoulder = np.array([lm[12].x, lm[12].y])  # Right shoulder
@@ -114,6 +129,8 @@ class HeuristicPoseBackend(BaseBackend):
             "bad_score": avg_bad_score,
             "angle_bad": angle_bad,
             "forward_bad": forward_bad,
+            "side_view_warning": False,
+            "side_view_info": side_view_info,
         }
 
         return label, conf, extras
@@ -199,3 +216,51 @@ class HeuristicPoseBackend(BaseBackend):
                 f"Forward: {head_forward_ratio:.3f}, "
                 f"Score: {avg_bad_score:.3f}"
             )
+
+    def _validate_side_view(self, landmarks) -> Tuple[bool, Dict[str, Any]]:
+        """Validate if user is positioned sideways (not frontal).
+
+        Uses shoulder width as indicator:
+        - Narrow shoulder width (< threshold) = side view (good)
+        - Wide shoulder width (> threshold) = frontal view (bad)
+
+        Args:
+            landmarks: MediaPipe pose landmarks
+
+        Returns:
+            Tuple of (is_side_view, info_dict)
+        """
+        # Get shoulder landmarks (11 = left shoulder, 12 = right shoulder)
+        left_shoulder = landmarks[11]
+        right_shoulder = landmarks[12]
+
+        # Check landmark visibility/confidence
+        if (
+            left_shoulder.visibility < POSTURE_CONFIG.side_view_confidence_threshold
+            or right_shoulder.visibility < POSTURE_CONFIG.side_view_confidence_threshold
+        ):
+            # If shoulders not visible enough, assume it's okay to avoid false warnings
+            return True, {
+                "shoulder_width_ratio": 0.0,
+                "threshold": POSTURE_CONFIG.side_view_shoulder_width_threshold,
+                "warning": "Low landmark visibility",
+            }
+
+        # Calculate shoulder width as horizontal distance
+        shoulder_width = abs(left_shoulder.x - right_shoulder.x)
+
+        # Shoulder width ratio (relative to frame width, which is normalized to 1.0)
+        # In side view, shoulders are nearly aligned, so width should be small
+        # In frontal view, shoulders are far apart, so width is large
+        is_side_view = (
+            shoulder_width < POSTURE_CONFIG.side_view_shoulder_width_threshold
+        )
+
+        info = {
+            "shoulder_width_ratio": shoulder_width,
+            "threshold": POSTURE_CONFIG.side_view_shoulder_width_threshold,
+            "left_shoulder_visibility": left_shoulder.visibility,
+            "right_shoulder_visibility": right_shoulder.visibility,
+        }
+
+        return is_side_view, info

@@ -21,7 +21,9 @@ class PostureSettings:
     smoothing_buffer_size: int = 5
 
     # Alert settings
-    default_min_bad_ratio: float = 0.5  # Threshold for bad posture detection (0.5 = 50% of frames must be bad)
+    default_min_bad_ratio: float = (
+        0.5  # Threshold for bad posture detection (0.5 = 50% of frames must be bad)
+    )
     default_voice_trigger_delay: float = 3.0  # Seconds of bad posture before voice
     speech_cooldown: float = 4.0  # Seconds between speech alerts
 
@@ -35,6 +37,14 @@ class PostureSettings:
 
     # Head forward position threshold
     head_forward_threshold: float = 0.15
+
+    # Side-view validation settings
+    # Shoulder width ratio threshold: ratio of shoulder width to frame width
+    # Lower values indicate side view (shoulders are aligned), higher values indicate frontal view
+    side_view_shoulder_width_threshold: float = 0.15  # < 15% of frame width = side view
+    side_view_confidence_threshold: float = (
+        0.5  # Minimum landmark visibility for validation
+    )
 
 
 @dataclass

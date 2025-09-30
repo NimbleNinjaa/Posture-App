@@ -181,11 +181,23 @@ class PostureApp(QtWidgets.QMainWindow):
         bad_ratio = info.get("bad_ratio", 0.0)
         disp = frame_bgr.copy()
 
+        # Check for side-view warning
+        extras = info.get("extras", {})
+        side_view_warning = extras.get("side_view_warning", False)
+
+        if side_view_warning:
+            # Draw warning overlay when not positioned sideways
+            self._draw_side_view_warning(disp, extras.get("side_view_info", {}))
+
         # Update status chip
         self._update_status_chip(label, conf, bad_ratio, info)
 
-        # Process posture timing and voice alerts
-        self._process_posture_timing(bad_ratio)
+        # Process posture timing and voice alerts (only if properly positioned)
+        if not side_view_warning:
+            self._process_posture_timing(bad_ratio)
+        else:
+            # Reset timing when not properly positioned
+            self._reset_posture_timing()
 
         # Convert and display frame
         self._display_frame(disp)
@@ -302,6 +314,145 @@ class PostureApp(QtWidgets.QMainWindow):
             )
         self.bad_posture_start_time = None
         self.bad_posture_accumulated_time = 0.0
+
+    def _draw_side_view_warning(
+        self, frame: np.ndarray, side_view_info: Dict[str, Any]
+    ) -> None:
+        """Draw warning overlay when user is not positioned sideways.
+
+        Args:
+            frame: Video frame to draw on
+            side_view_info: Information about side-view validation
+        """
+        h, w = frame.shape[:2]
+
+        # Draw semi-transparent overlay
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        # Warning text
+        warning_text = "⚠️ POSITION YOURSELF SIDEWAYS"
+        instruction_text = "Turn so your side faces the camera"
+
+        # Get text size for centering
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.2
+        thickness = 2
+
+        (text_width, text_height), _ = cv2.getTextSize(
+            warning_text, font, font_scale, thickness
+        )
+        (inst_width, inst_height), _ = cv2.getTextSize(instruction_text, font, 0.8, 2)
+
+        # Draw warning text (centered)
+        warning_x = (w - text_width) // 2
+        warning_y = (h // 2) - 40
+        cv2.putText(
+            frame,
+            warning_text,
+            (warning_x, warning_y),
+            font,
+            font_scale,
+            (0, 140, 255),  # Orange color
+            thickness,
+            cv2.LINE_AA,
+        )
+
+        # Draw instruction text
+        inst_x = (w - inst_width) // 2
+        inst_y = warning_y + 50
+        cv2.putText(
+            frame,
+            instruction_text,
+            (inst_x, inst_y),
+            font,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Draw visual indicator showing proper positioning
+        self._draw_positioning_guide(frame, w, h)
+
+        # Display shoulder width info for debugging
+        shoulder_width_ratio = side_view_info.get("shoulder_width_ratio", 0.0)
+        threshold = side_view_info.get("threshold", 0.15)
+        debug_text = (
+            f"Shoulder width: {shoulder_width_ratio:.2f} (need < {threshold:.2f})"
+        )
+        cv2.putText(
+            frame,
+            debug_text,
+            (20, h - 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def _draw_positioning_guide(self, frame: np.ndarray, w: int, h: int) -> None:
+        """Draw visual guide showing proper side-view positioning.
+
+        Args:
+            frame: Video frame to draw on
+            w: Frame width
+            h: Frame height
+        """
+        # Draw two stick figures: one showing wrong (frontal) and one showing correct (side) view
+        guide_y = h - 180
+
+        # Wrong position (frontal view) - red X
+        wrong_x = w // 3
+        cv2.putText(
+            frame,
+            "❌ Frontal",
+            (wrong_x - 50, guide_y - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        # Simple frontal person representation
+        cv2.circle(frame, (wrong_x, guide_y), 15, (0, 0, 255), 2)  # Head
+        cv2.line(
+            frame, (wrong_x, guide_y + 15), (wrong_x, guide_y + 60), (0, 0, 255), 2
+        )  # Body
+        cv2.line(
+            frame,
+            (wrong_x - 30, guide_y + 35),
+            (wrong_x + 30, guide_y + 35),
+            (0, 0, 255),
+            2,
+        )  # Arms
+
+        # Correct position (side view) - green check
+        correct_x = 2 * w // 3
+        cv2.putText(
+            frame,
+            "✓ Side View",
+            (correct_x - 50, guide_y - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        # Simple side view person representation
+        cv2.circle(frame, (correct_x, guide_y), 15, (0, 255, 0), 2)  # Head
+        cv2.line(
+            frame, (correct_x, guide_y + 15), (correct_x, guide_y + 60), (0, 255, 0), 2
+        )  # Body
+        cv2.line(
+            frame,
+            (correct_x, guide_y + 35),
+            (correct_x + 30, guide_y + 30),
+            (0, 255, 0),
+            2,
+        )  # Arm
 
     def _display_frame(self, frame: np.ndarray) -> None:
         """Convert and display the video frame.

@@ -29,7 +29,6 @@ class SettingsDialog(QtWidgets.QDialog):
         if self.parent_app:
             self.original_cam_index = self.parent_app.worker.cam_index
             self.original_sensitivity = self.parent_app.min_bad_ratio
-            self.original_alert_enabled = self.parent_app.alert_enabled
             self.original_voice_enabled = self.parent_app.voice_enabled
             self.original_voice_delay = self.parent_app.voice_trigger_delay
 
@@ -91,17 +90,14 @@ class SettingsDialog(QtWidgets.QDialog):
 
         voice_delay_row = hstack([voice_delay_label, self.voice_delay_spinbox])
 
-        # Toggle checkboxes
-        self.chk_alert = QtWidgets.QCheckBox("Visual alerts")
+        # Voice alerts checkbox
         self.chk_voice = QtWidgets.QCheckBox("Voice alerts")
 
         if self.parent_app:
-            self.chk_alert.setChecked(self.parent_app.alert_enabled)
             self.chk_voice.setChecked(self.parent_app.voice_enabled)
 
         alert_layout.addWidget(sens_row)
         alert_layout.addWidget(voice_delay_row)
-        alert_layout.addWidget(self.chk_alert)
         alert_layout.addWidget(self.chk_voice)
 
         # Buttons
@@ -182,8 +178,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.parent_app.bad_posture_start_time = None
             self.parent_app.bad_posture_accumulated_time = 0.0
 
-        # Apply alert settings
-        self.parent_app.alert_enabled = self.chk_alert.isChecked()
+        # Apply voice alert setting
         self.parent_app.voice_enabled = self.chk_voice.isChecked()
 
         self.accept()

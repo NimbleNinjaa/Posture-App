@@ -18,19 +18,20 @@ class PostureSettings:
     """Posture detection and alert configuration."""
 
     # Pose detection thresholds
-    angle_threshold_deg: float = 15.0
     smoothing_buffer_size: int = 5
-    bad_smoothing_buffer_size: int = 20  # ~2/3 sec at 30 FPS
 
     # Alert settings
-    default_min_bad_ratio: float = 0.3  # Lower threshold - more sensitive
+    default_min_bad_ratio: float = 0.5  # Threshold for bad posture detection (0.5 = 50% of frames must be bad)
     default_voice_trigger_delay: float = 3.0  # Seconds of bad posture before voice
     speech_cooldown: float = 4.0  # Seconds between speech alerts
 
-    # Pose angle thresholds for classification
-    good_posture_angle_min: float = 165.0  # 165-180° is good
-    mild_posture_angle_min: float = 150.0  # 150-165° is mild
-    # < 150° is considered bad
+    # Shoulder angle thresholds for classification
+    # Note: Angle is measured at the shoulder point between ear→shoulder and hip→shoulder vectors
+    # Smaller angles (<150°) indicate slouching/forward lean (bad posture)
+    # Larger angles (165-180°) indicate upright alignment (good posture)
+    shoulder_angle_good_min: float = 165.0  # 165-180° is good posture
+    shoulder_angle_mild_min: float = 150.0  # 150-165° is mild posture
+    # < 150° is considered bad posture
 
     # Head forward position threshold
     head_forward_threshold: float = 0.15
@@ -68,13 +69,10 @@ APP_LABELS = AppLabels()
 # TTS Configuration
 TTS_MESSAGES = {
     "bad_posture": "You have bad posture. Please straighten up.",
-    "camera_started": "Camera started",
-    "camera_stopped": "Camera stopped",
 }
 
 # Debug settings
 DEBUG_SETTINGS = {
     "print_angle_info": True,
     "angle_print_interval": 30,  # Every 30 frames
-    "print_posture_timing": True,
 }

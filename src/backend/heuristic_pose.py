@@ -2,7 +2,7 @@
 
 import math
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -17,33 +17,36 @@ class HeuristicPoseBackend(BaseBackend):
     """MediaPipe-based pose detection backend.
 
     Uses MediaPipe Pose to estimate angle between ear-shoulder-hip.
-    If head/torso angle exceeds threshold, marks as bad posture.
+    Classifies posture based on angle thresholds defined in config.
+
+    Angle Interpretation:
+    --------------------
+    The shoulder angle is measured at the shoulder point between two vectors:
+    - Vector 1: ear → shoulder
+    - Vector 2: hip → shoulder
+
+    When sitting upright with good posture, these three points form a nearly
+    straight line, resulting in an angle close to 180°.
+
+    When slouching or leaning forward:
+    - The ear moves forward relative to the shoulder
+    - The angle at the shoulder decreases (becomes more acute)
+    - Smaller angles (<150°) indicate bad posture
+    - Larger angles (165-180°) indicate good posture
     """
 
-    def __init__(self, labels: List[str], angle_threshold_deg: Optional[float] = None):
+    def __init__(self, labels: List[str]):
         """Initialize the heuristic pose backend.
 
         Args:
             labels: List of posture labels
-            angle_threshold_deg: Angle threshold for bad posture detection.
-                                If None, uses config default.
         """
         super().__init__(labels)
-
-        if mp_pose is None:
-            raise RuntimeError("mediapipe not installed. pip install mediapipe")
 
         self.pose = mp_pose(
             static_image_mode=False, model_complexity=1, enable_segmentation=False
         )
 
-        self.angle_threshold = (
-            angle_threshold_deg
-            if angle_threshold_deg is not None
-            else POSTURE_CONFIG.angle_threshold_deg
-        )
-
-        self.last_landmarks = None
         self.smoothing_buffer = deque(maxlen=POSTURE_CONFIG.smoothing_buffer_size)
 
         # Debug frame counter
@@ -68,7 +71,6 @@ class HeuristicPoseBackend(BaseBackend):
             return "unknown", 0.0, {}
 
         lm = getattr(res, "pose_landmarks").landmark
-        self.last_landmarks = lm
 
         # Right side landmarks (camera side). If mirrored, either side works.
         ear = np.array([lm[8].x, lm[8].y])  # Right ear
@@ -88,7 +90,7 @@ class HeuristicPoseBackend(BaseBackend):
         )
 
         # Classify posture based on angle and head position
-        angle_bad = shoulder_angle < POSTURE_CONFIG.mild_posture_angle_min
+        angle_bad = shoulder_angle < POSTURE_CONFIG.shoulder_angle_mild_min
         forward_bad = head_forward_ratio > POSTURE_CONFIG.head_forward_threshold
 
         # Use smoothing buffer for stability
@@ -188,7 +190,7 @@ class HeuristicPoseBackend(BaseBackend):
                 if bad
                 else (
                     "MILD"
-                    if shoulder_angle < POSTURE_CONFIG.good_posture_angle_min
+                    if shoulder_angle < POSTURE_CONFIG.shoulder_angle_good_min
                     else "GOOD"
                 )
             )

@@ -32,7 +32,6 @@ class PostureApp(QtWidgets.QMainWindow):
         self.speech_manager = SpeechManager()
 
         # Application state
-        self.alert_enabled = True
         self.voice_enabled = True
         self.min_bad_ratio = POSTURE_CONFIG.default_min_bad_ratio
         self.voice_trigger_delay = POSTURE_CONFIG.default_voice_trigger_delay

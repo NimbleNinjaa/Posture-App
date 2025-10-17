@@ -12,6 +12,7 @@ from src.backend import HeuristicPoseBackend
 from src.config import APP_LABELS, POSTURE_CONFIG, UI_CONFIG
 from src.core import SpeechManager, VideoThread
 from src.ui.helpers import MODERN_STYLE, hstack, stretch, vstack
+from src.ui.overlay_window import PostureOverlay
 from src.ui.settings_dialog import SettingsDialog
 
 
@@ -33,11 +34,17 @@ class PostureApp(QtWidgets.QMainWindow):
 
         # Application state
         self.voice_enabled = True
+        self.overlay_enabled = POSTURE_CONFIG.overlay_enabled
         self.min_bad_ratio = POSTURE_CONFIG.default_min_bad_ratio
         self.voice_trigger_delay = POSTURE_CONFIG.default_voice_trigger_delay
         self.bad_posture_start_time: Optional[float] = None
         self.bad_posture_accumulated_time = 0.0
         self.last_voice_trigger_time = 0.0
+
+        # Create overlay window
+        self.overlay = PostureOverlay()
+        if self.overlay_enabled:
+            self.overlay.show()
 
         # Build UI and initialize video
         self._build_ui()
@@ -184,7 +191,7 @@ class PostureApp(QtWidgets.QMainWindow):
         # Check for side-view warning
         extras = info.get("extras", {})
         side_view_warning = extras.get("side_view_warning", False)
-
+        
         if side_view_warning:
             # Draw warning overlay when not positioned sideways
             self._draw_side_view_warning(disp, extras.get("side_view_info", {}))
@@ -192,12 +199,20 @@ class PostureApp(QtWidgets.QMainWindow):
         # Update status chip
         self._update_status_chip(label, conf, bad_ratio, info)
 
+        # Update screen overlay
+        is_bad = bad_ratio >= self.min_bad_ratio
+        if self.overlay_enabled and not side_view_warning:
+            self.overlay.update_status(label, is_bad)
+
         # Process posture timing and voice alerts (only if properly positioned)
         if not side_view_warning:
             self._process_posture_timing(bad_ratio)
         else:
             # Reset timing when not properly positioned
             self._reset_posture_timing()
+            # Update overlay to show unknown status
+            if self.overlay_enabled:
+                self.overlay.update_status("unknown", False)
 
         # Convert and display frame
         self._display_frame(disp)
@@ -483,6 +498,9 @@ class PostureApp(QtWidgets.QMainWindow):
         try:
             self.stop_camera()
             self.speech_manager.cleanup()
+            # Close overlay window
+            if hasattr(self, 'overlay'):
+                self.overlay.close()
         except Exception:
             pass
 

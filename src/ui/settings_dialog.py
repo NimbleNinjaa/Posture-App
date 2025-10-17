@@ -31,6 +31,7 @@ class SettingsDialog(QtWidgets.QDialog):
             self.original_sensitivity = self.parent_app.min_bad_ratio
             self.original_voice_enabled = self.parent_app.voice_enabled
             self.original_voice_delay = self.parent_app.voice_trigger_delay
+            self.original_overlay_enabled = self.parent_app.overlay_enabled
 
         self._build_ui()
         self._apply_style()
@@ -96,9 +97,17 @@ class SettingsDialog(QtWidgets.QDialog):
         if self.parent_app:
             self.chk_voice.setChecked(self.parent_app.voice_enabled)
 
+        # Screen overlay checkbox
+        self.chk_overlay = QtWidgets.QCheckBox("Screen overlay")
+        self.chk_overlay.setToolTip("Show posture status overlay on screen (stays visible even when app is minimized)")
+
+        if self.parent_app:
+            self.chk_overlay.setChecked(self.parent_app.overlay_enabled)
+
         alert_layout.addWidget(sens_row)
         alert_layout.addWidget(voice_delay_row)
         alert_layout.addWidget(self.chk_voice)
+        alert_layout.addWidget(self.chk_overlay)
 
         # Buttons
         button_layout = QtWidgets.QHBoxLayout()
@@ -180,5 +189,16 @@ class SettingsDialog(QtWidgets.QDialog):
 
         # Apply voice alert setting
         self.parent_app.voice_enabled = self.chk_voice.isChecked()
+
+        # Apply overlay setting
+        new_overlay_enabled = self.chk_overlay.isChecked()
+        if new_overlay_enabled != self.original_overlay_enabled:
+            self.parent_app.overlay_enabled = new_overlay_enabled
+            if new_overlay_enabled:
+                self.parent_app.overlay.show()
+                self.parent_app.log_msg("Screen overlay enabled")
+            else:
+                self.parent_app.overlay.hide()
+                self.parent_app.log_msg("Screen overlay disabled")
 
         self.accept()

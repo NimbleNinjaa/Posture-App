@@ -46,6 +46,9 @@ class PostureSettings:
         0.5  # Minimum landmark visibility for validation
     )
 
+    # Screen overlay settings
+    overlay_enabled: bool = True  # Enable/disable screen overlay
+
 
 @dataclass
 class UISettings:
@@ -60,6 +63,12 @@ class UISettings:
     good_posture_color: str = "#2e7d32"
     bad_posture_color: str = "#c9342f"
     unknown_posture_color: str = "#444"
+
+    # Screen overlay settings
+    overlay_position: tuple = (20, 20)  # Top-left corner position (x, y)
+    overlay_font_size: int = 24
+    overlay_padding: int = 15
+    overlay_opacity: float = 0.9
 
 
 @dataclass

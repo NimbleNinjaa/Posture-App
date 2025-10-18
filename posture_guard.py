@@ -18,8 +18,11 @@ import os
 import sys
 import time
 import math
+import threading
+import queue
+import shutil
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import cv2
@@ -27,46 +30,31 @@ import cv2
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
-# Optional deps guarded by try/except
+# Required MediaPipe for pose detection
 try:
-    import onnxruntime as ort  # For ONNX models
-except Exception:
-    ort = None
-
-try:
-    import pyttsx3  # Offline TTS
-except Exception:
-    pyttsx3 = None
-
-# Optional: Ultralytics YOLO (for .pt models)
-try:
-    from ultralytics import YOLO  # type: ignore
-except Exception:
-    YOLO = None
-
-# Optional: MediaPipe heuristic fallback
-try:
-    import mediapipe as mp  # type: ignore
     from mediapipe.python.solutions.pose import Pose as mp_pose
 except Exception:
-    mp_pose = None
+    raise RuntimeError("MediaPipe is required. Install with: pip install mediapipe")
+
+# Universal TTS with better voice quality
+try:
+    from gtts import gTTS
+    import pygame
+    import tempfile
+    TTS_AVAILABLE = True
+except Exception as e:
+    print(f"TTS imports failed: {e}")
+    gTTS = None
+    pygame = None
+    tempfile = None
+    TTS_AVAILABLE = False
 
 
 # ------------------------
 # Utility helpers
 # ------------------------
 
-def load_names(names_path: str) -> List[str]:
-    labels: List[str] = []
-    try:
-        with open(names_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    labels.append(line)
-    except Exception as e:
-        print(f"Failed to read names file: {e}")
-    return labels or ["good", "bad"]
+# Removed load_names function - using default labels only
 
 
 def draw_text(img, text, org, scale=0.9, thickness=2, color=(255, 255, 255), bg=(0, 0, 0)):
@@ -98,170 +86,28 @@ class BaseBackend:
         raise NotImplementedError
 
     def draw(self, frame_bgr: np.ndarray, extras: dict) -> None:
-        pass
+        del frame_bgr, extras  # Mark as intentionally unused
 
 
-class OnnxClassifierBackend(BaseBackend):
-    def __init__(self, labels: List[str], onnx_path: str, input_size: Tuple[int, int] = (224, 224)):
-        super().__init__(labels)
-        if ort is None:
-            raise RuntimeError("onnxruntime not installed. pip install onnxruntime")
-        self.sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])  # local CPU
-        self.input_name = self.sess.get_inputs()[0].name
-        self.output_name = self.sess.get_outputs()[0].name
-        self.input_size = input_size
-
-    def preprocess(self, img_bgr: np.ndarray) -> np.ndarray:
-        img = cv2.resize(img_bgr, self.input_size)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        img = (img - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
-        img = np.transpose(img, (2, 0, 1))[None, ...]  # NCHW
-        return img
-
-    def inference(self, frame_bgr: np.ndarray):
-        x = self.preprocess(frame_bgr)
-        logits = self.sess.run([self.output_name], {self.input_name: x})[0]
-        logits = np.array(logits)
-        probs = softmax(logits[0])
-        idx = int(np.argmax(probs))
-        label = self.labels[idx] if idx < len(self.labels) else str(idx)
-        conf = float(probs[idx])
-        return label, conf, {}
-
-
-def softmax(z: np.ndarray) -> np.ndarray:
-    z = z - np.max(z)
-    e = np.exp(z)
-    return e / (np.sum(e) + 1e-9)
-
-
-def _is_bad_label(name: str) -> bool:
-    n = name.lower()
-    return (n.endswith("_bad") or
-            n in ("bad", "bad_posture", "slouch", "incorrect"))
-
-
-class UltralyticsYOLOBackend(BaseBackend):
-    def __init__(self, labels: List[str], pt_path: str):
-        super().__init__(labels)
-        if YOLO is None:
-            raise RuntimeError("ultralytics not installed. pip install ultralytics")
-        self.model = YOLO(pt_path)
-        self.model.fuse()
-
-    def inference(self, frame_bgr: np.ndarray):
-        results = self.model.predict(source=frame_bgr, verbose=False, imgsz=640)
-        bad_score = 0.0
-        boxes = []
-        for r in results:
-            for b in r.boxes:
-                cls_idx = int(b.cls[0])
-                conf = float(b.conf[0])
-                name = self.model.names.get(cls_idx, str(cls_idx))
-                xyxy = b.xyxy[0].tolist()
-                boxes.append((xyxy, name, conf))
-                if _is_bad_label(name):
-                    bad_score = max(bad_score, conf)
-        label = "bad" if bad_score > 0 else "good"
-        conf = bad_score if label == "bad" else 1.0 - bad_score
-        return label, conf, {"boxes": boxes}
-
-    def draw(self, frame_bgr: np.ndarray, extras: dict) -> None:
-        for xyxy, name, conf in extras.get("boxes", []):
-            x1, y1, x2, y2 = map(int, xyxy)
-            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (50, 200, 50), 2)
-            draw_text(frame_bgr, f"{name} {conf:.2f}", (x1, y1 - 8))
-
-
-class OpenCVYoloBackend(BaseBackend):
-    def __init__(self, labels: List[str], cfg_path: str, weights_path: str):
-        super().__init__(labels)
-        # Parse cfg to pick correct network input size and class count
-        self.net_w, self.net_h = self._read_net_size(cfg_path)
-        self.cfg_classes = self._read_classes(cfg_path)
-        self.net = cv2.dnn.readNetFromDarknet(cfg_path, weights_path)
-        self.out_names = self.net.getUnconnectedOutLayersNames()
-
-    def _read_net_size(self, cfg_path: str) -> Tuple[int, int]:
-        w, h = 608, 608  # sensible default
-        try:
-            with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    s = line.strip().split('=')
-                    if len(s) == 2:
-                        k, v = s[0].strip().lower(), s[1].strip()
-                        if k == 'width':
-                            w = int(v)
-                        elif k == 'height':
-                            h = int(v)
-        except Exception:
-            pass
-        # make sure multiples of 32
-        w = max(32, (w // 32) * 32)
-        h = max(32, (h // 32) * 32)
-        return w, h
-
-    def _read_classes(self, cfg_path: str) -> Optional[int]:
-        try:
-            with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    if line.strip().lower().startswith('classes='):
-                        return int(line.split('=')[1])
-        except Exception:
-            pass
-        return None
-
-    def inference(self, frame_bgr: np.ndarray):
-        blob = cv2.dnn.blobFromImage(frame_bgr, 1/255.0, (self.net_w, self.net_h), swapRB=True, crop=False)
-        self.net.setInput(blob)
-        outs = self.net.forward(self.out_names)
-        H, W = frame_bgr.shape[:2]
-        boxes = []
-        bad_score = 0.0
-        for out in outs:
-            for det in out:
-                det = np.array(det)
-                scores = det[5:]
-                cls = int(np.argmax(scores))
-                conf = float(scores[cls])
-                if conf < 0.4:
-                    continue
-                cx, cy, w, h = det[0:4]
-                x = int((cx - w/2) * W)
-                y = int((cy - h/2) * H)
-                w = int(w * W)
-                h = int(h * H)
-                name = self.labels[cls] if cls < len(self.labels) else str(cls)
-                boxes.append(((x, y, w, h), name, conf))
-                if _is_bad_label(name):
-                    bad_score = max(bad_score, conf)
-        label = "bad" if bad_score > 0 else "good"
-        conf = bad_score if label == "bad" else 1.0 - bad_score
-        return label, conf, {"boxes": boxes}
-
-    def draw(self, frame_bgr: np.ndarray, extras: dict) -> None:
-        for (x, y, w, h), name, conf in extras.get("boxes", []):
-            cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (50, 200, 50), 2)
-            draw_text(frame_bgr, f"{name} {conf:.2f}", (x, max(20, y - 8)))
+# Removed unused model backends - using MediaPipe only
 
 
 class HeuristicPoseBackend(BaseBackend):
     """No model required – uses MediaPipe Pose to estimate angle between ear-shoulder-hip.
     If head/torso angle exceeds threshold, marks as bad.
     """
-    def __init__(self, labels: List[str], angle_threshold_deg: float = 25.0):
+    def __init__(self, labels: List[str], angle_threshold_deg: float = 15.0):
         super().__init__(labels)
         if mp_pose is None:
             raise RuntimeError("mediapipe not installed. pip install mediapipe")
         self.pose = mp_pose(static_image_mode=False, model_complexity=1, enable_segmentation=False)
-        self.angle_threshold = angle_threshold_deg
+        self.angle_threshold = angle_threshold_deg  # Increased from 25 to 35 for better sensitivity
         self.last_landmarks = None
+        self.smoothing_buffer = deque(maxlen=5)  # Add smoothing buffer for stability
 
     def inference(self, frame_bgr: np.ndarray):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         res = self.pose.process(rgb)
-        print('MediaPipe result attributes:', dir(res))  # DEBUG
         if not hasattr(res, 'pose_landmarks') or getattr(res, 'pose_landmarks', None) is None:
             return "unknown", 0.0, {}
         lm = getattr(res, 'pose_landmarks').landmark
@@ -270,17 +116,53 @@ class HeuristicPoseBackend(BaseBackend):
         ear = np.array([lm[8].x, lm[8].y])   # Right ear
         shoulder = np.array([lm[12].x, lm[12].y])  # Right shoulder
         hip = np.array([lm[24].x, lm[24].y])  # Right hip
-        # Angle at shoulder between ear-shoulder and hip-shoulder
+        # Calculate forward head posture using multiple metrics
+        # 1. Angle at shoulder between ear-shoulder and hip-shoulder
         v1 = ear - shoulder
         v2 = hip - shoulder
         def angle(a, b):
             cosang = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6)
             return math.degrees(math.acos(np.clip(cosang, -1, 1)))
-        ang = angle(v1, v2)
-        bad = ang < (180 - self.angle_threshold)
+        shoulder_angle = angle(v1, v2)
+
+        # 2. Forward head position (ear x-coordinate relative to shoulder)
+        head_forward_ratio = abs(ear[0] - shoulder[0]) / abs(hip[0] - shoulder[0] + 1e-6)
+
+        # Proper posture guidelines:
+        # Neutral alignment: 165-180°
+        # Mild forward head: 150-165°
+        # Bad posture: < 150°
+        angle_bad = shoulder_angle < 150  # Bad posture when < 150°
+        forward_bad = head_forward_ratio > 0.15  # Head significantly forward
+
+        # Use smoothing buffer for stability
+        combined_bad_score = (angle_bad * 0.8) + (forward_bad * 0.2)  # Angle primary, forward secondary
+        self.smoothing_buffer.append(combined_bad_score)
+        avg_bad_score = sum(self.smoothing_buffer) / len(self.smoothing_buffer)
+
+        bad = avg_bad_score > 0.6  # Clear threshold for bad posture
+
+        # Debug output to track angles
+        if hasattr(self, '_debug_frame_count'):
+            self._debug_frame_count += 1
+        else:
+            self._debug_frame_count = 0
+
+        if self._debug_frame_count % 30 == 0:  # Every 30 frames (~1 second)
+            posture_status = "BAD" if bad else ("MILD" if shoulder_angle < 165 else "GOOD")
+            print(f"📐 Angle: {shoulder_angle:.1f}° ({posture_status}), Forward: {head_forward_ratio:.3f}, Score: {avg_bad_score:.3f}")
         label = "bad" if bad else "good"
-        conf = min(1.0, abs((180 - ang) / self.angle_threshold)) if bad else 0.8
-        return label, conf, {"angle": ang, "landmarks": lm}
+        conf = min(1.0, avg_bad_score) if bad else max(0.7, 1.0 - avg_bad_score)
+
+        extras = {
+            "angle": shoulder_angle,
+            "head_forward": head_forward_ratio,
+            "landmarks": lm,
+            "bad_score": avg_bad_score,
+            "angle_bad": angle_bad,
+            "forward_bad": forward_bad
+        }
+        return label, conf, extras
 
     def draw(self, frame_bgr: np.ndarray, extras: dict) -> None:
         if not extras:
@@ -314,16 +196,30 @@ class VideoThread(QtCore.QThread):
         self.running = False
         self.backend: Optional[BaseBackend] = None
         self.bad_smoothing = deque(maxlen=20)  # ~2/3 sec at 30 FPS
+        self.camera_change_requested = False
+        self.new_cam_index = 0
 
-    def set_backend(self, backend: BaseBackend):
+    def set_backend(self, backend: Optional[BaseBackend]):
         self.backend = backend
 
+    def change_camera(self, new_cam_index: int):
+        """Request camera change while thread is running"""
+        self.new_cam_index = new_cam_index
+        self.camera_change_requested = True
+
     def run(self):
-        self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW if os.name == 'nt' else 0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self._init_camera()
         self.running = True
-        while self.running and self.cap.isOpened():
+        while self.running:
+            # Check for camera change request
+            if self.camera_change_requested:
+                self._change_camera_internal()
+                self.camera_change_requested = False
+
+            if self.cap is None or not self.cap.isOpened():
+                time.sleep(0.01)
+                continue
+
             ok, frame = self.cap.read()
             if not ok:
                 time.sleep(0.01)
@@ -344,11 +240,33 @@ class VideoThread(QtCore.QThread):
                     self.backend.draw(frame, extras)
                 except Exception:
                     pass
-                self.frame_ready.emit(frame, label, float(conf if isinstance(conf, (int, float)) else 0.0), {"bad_ratio": bad_ratio})
+                self.frame_ready.emit(frame, label, float(conf if isinstance(conf, (int, float)) else 0.0), {"bad_ratio": bad_ratio, "extras": extras})
             else:
                 self.frame_ready.emit(frame, "unknown", 0.0, {"bad_ratio": 0.0})
         if self.cap is not None:
             self.cap.release()
+
+    def _init_camera(self):
+        """Initialize camera capture"""
+        try:
+            if self.cap is not None:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW if os.name == 'nt' else 0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            # Test if camera is working
+            if not self.cap.isOpened():
+                print(f"Warning: Could not open camera {self.cam_index}")
+        except Exception as e:
+            print(f"Error initializing camera {self.cam_index}: {e}")
+
+    def _change_camera_internal(self):
+        """Change camera while thread is running"""
+        print(f"Changing camera from {self.cam_index} to {self.new_cam_index}")
+        self.cam_index = self.new_cam_index
+        self._init_camera()
+        # Clear smoothing buffer when changing cameras
+        self.bad_smoothing.clear()
 
     def stop(self):
         self.running = False
@@ -356,6 +274,190 @@ class VideoThread(QtCore.QThread):
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+
+
+# ------------------------
+# Settings Dialog
+# ------------------------
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setFixedSize(400, 350)
+        self.parent_app = parent
+
+        # Store current settings
+        if self.parent_app:
+            self.original_cam_index = self.parent_app.worker.cam_index
+            self.original_sensitivity = self.parent_app.min_bad_ratio
+            self.original_alert_enabled = self.parent_app.alert_enabled
+            self.original_voice_enabled = self.parent_app.voice_enabled
+            self.original_voice_delay = self.parent_app.voice_trigger_delay
+
+        self._build_ui()
+        self._apply_style()
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(20)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Camera selector with dynamic detection
+        camera_group = QtWidgets.QGroupBox("Camera Settings")
+        camera_layout = QtWidgets.QVBoxLayout(camera_group)
+
+        self.camera_combo = QtWidgets.QComboBox()
+        self._populate_cameras()
+        if self.parent_app:
+            current_cam = self.parent_app.worker.cam_index
+            for i in range(self.camera_combo.count()):
+                if self.camera_combo.itemData(i) == current_cam:
+                    self.camera_combo.setCurrentIndex(i)
+                    break
+        # Remove direct connection - will apply on save
+
+        camera_layout.addWidget(QtWidgets.QLabel("Select Camera:"))
+        camera_layout.addWidget(self.camera_combo)
+
+        # Alert settings
+        alert_group = QtWidgets.QGroupBox("Alert Settings")
+        alert_layout = QtWidgets.QVBoxLayout(alert_group)
+
+        # Sensitivity slider
+        self.sens_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.sens_slider.setRange(10, 90)
+        if self.parent_app:
+            self.sens_slider.setValue(int(self.parent_app.min_bad_ratio * 100))
+        self.sens_slider.valueChanged.connect(self.update_sensitivity_label)
+
+        sens_label = QtWidgets.QLabel("Sensitivity:")
+        self.sens_value_label = QtWidgets.QLabel(f"{self.sens_slider.value()}%")
+        sens_row = hstack([sens_label, self.sens_slider, self.sens_value_label])
+
+        # Voice trigger delay setting
+        voice_delay_label = QtWidgets.QLabel("Voice trigger delay:")
+        self.voice_delay_spinbox = QtWidgets.QDoubleSpinBox()
+        self.voice_delay_spinbox.setRange(1.0, 30.0)  # 1 to 30 seconds
+        self.voice_delay_spinbox.setSingleStep(0.5)
+        self.voice_delay_spinbox.setSuffix(" seconds")
+        self.voice_delay_spinbox.setDecimals(1)
+        if self.parent_app:
+            self.voice_delay_spinbox.setValue(self.parent_app.voice_trigger_delay)
+        else:
+            self.voice_delay_spinbox.setValue(3.0)
+
+        voice_delay_row = hstack([voice_delay_label, self.voice_delay_spinbox])
+
+        # Toggle checkboxes
+        self.chk_alert = QtWidgets.QCheckBox("Visual alerts")
+        self.chk_voice = QtWidgets.QCheckBox("Voice alerts")
+        if self.parent_app:
+            self.chk_alert.setChecked(self.parent_app.alert_enabled)
+            self.chk_voice.setChecked(self.parent_app.voice_enabled)
+        # Remove direct connections - will apply on save
+
+        alert_layout.addWidget(sens_row)
+        alert_layout.addWidget(voice_delay_row)
+        alert_layout.addWidget(self.chk_alert)
+        alert_layout.addWidget(self.chk_voice)
+
+        # Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        self.cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.save_btn = QtWidgets.QPushButton("Save")
+
+        self.cancel_btn.clicked.connect(self.reject)
+        self.save_btn.clicked.connect(self.save_and_close)
+
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_btn)
+        button_layout.addWidget(self.save_btn)
+
+        layout.addWidget(camera_group)
+        layout.addWidget(alert_group)
+        layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QDialog { background: #0b0b0d; }
+            QGroupBox { color: #e5e5e9; font-size: 14px; font-weight: 600; padding-top: 15px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px 0 5px; }
+            QLabel, QCheckBox { color: #e5e5e9; font-size: 14px; }
+            QSlider::groove:horizontal { height: 6px; background: #222; border-radius: 3px; }
+            QSlider::handle:horizontal { width: 18px; background: #4b8bff; border-radius: 9px; margin: -6px 0; }
+            QPushButton { background: #141418; color: #e5e5e9; border: 1px solid #26262b; padding: 10px 16px; border-radius: 12px; font-weight: 600; }
+            QPushButton:hover { border-color: #3a3a42; }
+            QPushButton:pressed { background: #0e0e10; }
+            QComboBox { background: #141418; color: #e5e5e9; border: 1px solid #26262b; padding: 8px; border-radius: 8px; }
+            QComboBox::drop-down { border: none; }
+            QComboBox::down-arrow { image: none; }
+        """)
+
+    def _populate_cameras(self):
+        """Dynamically detect available cameras"""
+        available_cameras = []
+
+        # Test camera indices 0-9 to find available cameras
+        for i in range(10):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    available_cameras.append(i)
+                    camera_name = f"Camera {i}"
+                    if i == 0:
+                        camera_name += " (default)"
+                    self.camera_combo.addItem(camera_name, i)
+            cap.release()
+
+        if not available_cameras:
+            self.camera_combo.addItem("No cameras detected", 0)
+            print("Warning: No cameras detected")
+        else:
+            print(f"Detected cameras: {available_cameras}")
+
+    def update_sensitivity_label(self, v: int):
+        self.sens_value_label.setText(f"{v}%")
+
+    def save_and_close(self):
+        if not self.parent_app:
+            self.accept()
+            return
+
+        # Apply camera change
+        new_cam_index = self.camera_combo.itemData(self.camera_combo.currentIndex())
+        if new_cam_index != self.original_cam_index:
+            self.parent_app.log_msg(f"Camera changed to: {new_cam_index}")
+            if self.parent_app.worker.isRunning():
+                # Change camera while running
+                self.parent_app.worker.change_camera(new_cam_index)
+            else:
+                # Just update the index if not running
+                self.parent_app.worker.cam_index = new_cam_index
+
+        # Apply sensitivity change
+        new_sensitivity = self.sens_slider.value() / 100.0
+        if new_sensitivity != self.original_sensitivity:
+            self.parent_app.min_bad_ratio = new_sensitivity
+            self.parent_app.log_msg(f"Sensitivity set: {new_sensitivity:.2f}")
+
+        # Apply voice trigger delay change
+        new_voice_delay = self.voice_delay_spinbox.value()
+        if new_voice_delay != self.original_voice_delay:
+            self.parent_app.voice_trigger_delay = new_voice_delay
+            self.parent_app.log_msg(f"Voice trigger delay set: {new_voice_delay:.1f} seconds")
+            # Reset bad posture timing when delay changes
+            self.parent_app.bad_posture_start_time = None
+            self.parent_app.bad_posture_accumulated_time = 0.0
+
+        # Apply alert settings
+        self.parent_app.alert_enabled = self.chk_alert.isChecked()
+        self.parent_app.voice_enabled = self.chk_voice.isChecked()
+
+        self.accept()
 
 
 # ------------------------
@@ -368,21 +470,41 @@ class PostureApp(QtWidgets.QMainWindow):
         self.setWindowTitle("Posture Guard — Side View")
         self.resize(1100, 750)
         self.labels: List[str] = ["good", "bad"]
-        self.backend: Optional[BaseBackend] = None
-        self.tts_engine = None
-        if pyttsx3 is not None:
+        # Initialize MediaPipe backend by default
+        self.backend = HeuristicPoseBackend(self.labels)
+
+        # Initialize universal TTS system with Google TTS
+        self.speech_queue = queue.Queue(maxsize=1)
+        self.speech_worker_running = False
+        self.tts_available = False
+        self.last_speech_time = 0.0
+        self.speech_cooldown = 4.0  # 4 seconds between speech
+        if tempfile is not None:
+            self.temp_dir = tempfile.mkdtemp()
+        else:
+            self.temp_dir = "/tmp"
+
+        if TTS_AVAILABLE and pygame is not None:
             try:
-                self.tts_engine = pyttsx3.init()
-                self.tts_engine.setProperty('rate', 175)
-            except Exception:
-                self.tts_engine = None
+                # Initialize pygame mixer for audio playback
+                pygame.mixer.init()
+                self.tts_available = True
+                self._start_speech_worker()
+                print("Voice alerts enabled with high-quality TTS")
+            except Exception as e:
+                print(f"TTS initialization failed: {e}")
+                self.tts_available = False
+        else:
+            print("TTS libraries not available - voice alerts disabled")
 
         # State (must be set BEFORE building UI)
         self.alert_enabled = True
         self.voice_enabled = True
-        self.min_bad_ratio = 0.5  # how much recent history must be bad to alert
-        self.last_alert_ts = 0.0
-        self.alert_cooldown = 6.0  # seconds
+        self.min_bad_ratio = 0.3  # Lower threshold - more sensitive to bad posture
+        self.voice_trigger_delay = 3.0  # Seconds of bad posture before voice triggers
+        self.bad_posture_start_time = None  # When bad posture started
+        self.bad_posture_accumulated_time = 0.0  # Total time in bad posture
+        self.last_voice_trigger_time = 0.0  # When voice was last triggered
 
         self._build_ui()
 
@@ -390,12 +512,11 @@ class PostureApp(QtWidgets.QMainWindow):
         self.worker = VideoThread(cam_index=0)
         self.worker.frame_ready.connect(self.on_frame)
 
-        # State
-        self.alert_enabled = True
-        self.voice_enabled = True
-        self.min_bad_ratio = 0.5  # how much recent history must be bad to alert
-        self.last_alert_ts = 0.0
-        self.alert_cooldown = 6.0  # seconds
+        # Set up MediaPipe backend
+        self.worker.set_backend(self.backend)
+        self.log_msg("Using MediaPipe pose detection (default)")
+
+        # State (duplicate removed)
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -417,13 +538,9 @@ class PostureApp(QtWidgets.QMainWindow):
             "color: white; background: #444;"
         )
 
-        # Sensitivity slider
-        self.sens_slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
-        self.sens_slider.setRange(10, 90)
-        self.sens_slider.setValue(int(self.min_bad_ratio * 100))
-        self.sens_slider.valueChanged.connect(self.on_sensitivity)
-
-        sens_row = hstack([QtWidgets.QLabel("Alert sensitivity"), self.sens_slider])
+        # Settings button
+        self.btn_settings = QtWidgets.QPushButton("⚙️ Settings")
+        self.btn_settings.clicked.connect(self.open_settings)
 
         # Control buttons
         self.btn_start = QtWidgets.QPushButton("Start Camera")
@@ -431,16 +548,7 @@ class PostureApp(QtWidgets.QMainWindow):
         self.btn_start.clicked.connect(self.start_camera)
         self.btn_stop.clicked.connect(self.stop_camera)
 
-        buttons = hstack([self.btn_start, self.btn_stop])
-
-        # Toggles
-        self.chk_alert = QtWidgets.QCheckBox("Visual alerts")
-        self.chk_alert.setChecked(True)
-        self.chk_alert.toggled.connect(lambda v: setattr(self, 'alert_enabled', v))
-        self.chk_voice = QtWidgets.QCheckBox("Voice")
-        self.chk_voice.setChecked(True)
-        self.chk_voice.toggled.connect(lambda v: setattr(self, 'voice_enabled', v))
-        toggles = hstack([self.chk_alert, self.chk_voice])
+        buttons = hstack([self.btn_start, self.btn_stop, self.btn_settings])
 
         # Log area
         self.log = QtWidgets.QPlainTextEdit()
@@ -452,8 +560,6 @@ class PostureApp(QtWidgets.QMainWindow):
         layout_widget = vstack([
             self.video_label,
             hstack([QtWidgets.QLabel("Status:"), self.status_chip, stretch()]),
-            sens_row,
-            toggles,
             buttons,
             QtWidgets.QLabel("Activity log"),
             self.log,
@@ -478,32 +584,7 @@ class PostureApp(QtWidgets.QMainWindow):
         m_file.addAction(act_quit)
         act_quit.triggered.connect(self.close)
 
-        m_model = QtWidgets.QMenu("Model", self)
-        bar.addMenu(m_model)
-        self.backend_group = QtGui.QActionGroup(self)
-        self.backend_group.setExclusive(True)
-
-        self.act_backend_onnx = QtGui.QAction("Backend: ONNX (classification)", self)
-        self.act_backend_yolo_pt = QtGui.QAction("Backend: YOLO .pt (Ultralytics)", self)
-        self.act_backend_yolo_cv = QtGui.QAction("Backend: YOLO .cfg + .weights", self)
-        self.act_backend_heur = QtGui.QAction("Backend: Heuristic (MediaPipe)", self)
-        for a in (self.act_backend_onnx, self.act_backend_yolo_pt, self.act_backend_yolo_cv, self.act_backend_heur):
-            a.setCheckable(True)
-            m_model.addAction(a)
-            self.backend_group.addAction(a)
-        self.act_backend_yolo_cv.setChecked(True)
-
-        m_model.addSeparator()
-        act_load_names = QtGui.QAction("Load labels (.names)", self)
-        act_load_model = QtGui.QAction("Load model file…", self)
-        act_load_yolo_pair = QtGui.QAction("Load YOLO cfg + weights…", self)
-        m_model.addAction(act_load_names)
-        m_model.addAction(act_load_model)
-        m_model.addAction(act_load_yolo_pair)
-
-        act_load_names.triggered.connect(self.load_names_file)
-        act_load_model.triggered.connect(self.load_model_file)
-        act_load_yolo_pair.triggered.connect(self.load_yolo_pair)
+        # Model menu removed - using MediaPipe only
 
         m_cam = QtWidgets.QMenu("Camera", self)
         bar.addMenu(m_cam)
@@ -534,65 +615,13 @@ class PostureApp(QtWidgets.QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log.appendPlainText(f"[{ts}] {msg}")
 
-    def on_sensitivity(self, v: int):
-        self.min_bad_ratio = v / 100.0
-        self.log_msg(f"Sensitivity set: {self.min_bad_ratio:.2f}")
+    def open_settings(self):
+        settings_dialog = SettingsDialog(self)
+        settings_dialog.exec()
 
-    def load_names_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load labels (.names)", "", "Names (*.names);;All files (*)")
-        if not path:
-            return
-        self.labels = load_names(path)
-        self.log_msg(f"Loaded labels: {self.labels}")
-
-    def load_model_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load model", "", "Model (*.onnx *.pt);;All files (*)")
-        if not path:
-            return
-        try:
-            if path.lower().endswith('.onnx'):
-                self.backend = OnnxClassifierBackend(self.labels, path)
-                self.worker.set_backend(self.backend)
-                self.act_backend_onnx.setChecked(True)
-                self.log_msg(f"ONNX model loaded: {os.path.basename(path)}")
-            elif path.lower().endswith('.pt'):
-                self.backend = UltralyticsYOLOBackend(self.labels, path)
-                self.worker.set_backend(self.backend)
-                self.act_backend_yolo_pt.setChecked(True)
-                self.log_msg(f"YOLO .pt model loaded: {os.path.basename(path)}")
-            else:
-                QtWidgets.QMessageBox.warning(self, "Unsupported", "Please choose an .onnx or .pt file.")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Model load error", str(e))
-            self.log_msg(f"Model load failed: {e}")
-
-    def load_yolo_pair(self):
-        cfg, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select YOLO cfg", "", "Config (*.cfg)")
-        if not cfg:
-            return
-        weights, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select YOLO weights", "", "Weights (*.weights)")
-        if not weights:
-            return
-        try:
-            self.backend = OpenCVYoloBackend(self.labels, cfg, weights)
-            self.worker.set_backend(self.backend)
-            self.act_backend_yolo_cv.setChecked(True)
-            self.log_msg(f"YOLO cfg+weights loaded: {os.path.basename(cfg)}, {os.path.basename(weights)}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Model load error", str(e))
-            self.log_msg(f"Model load failed: {e}")
 
     def start_camera(self):
         if not self.worker.isRunning():
-            if self.backend is None and mp_pose is not None:
-                # default to heuristic so user sees something immediately
-                try:
-                    self.backend = HeuristicPoseBackend(self.labels)
-                    self.worker.set_backend(self.backend)
-                    self.act_backend_heur.setChecked(True)
-                    self.log_msg("Using heuristic backend (MediaPipe)")
-                except Exception as e:
-                    self.log_msg(f"Heuristic init failed: {e}")
             self.worker.start()
             self.log_msg("Camera started")
 
@@ -601,13 +630,83 @@ class PostureApp(QtWidgets.QMainWindow):
             self.worker.stop()
             self.log_msg("Camera stopped")
 
-    def speak(self, text: str):
-        if self.tts_engine is None:
+    def _start_speech_worker(self):
+        """Start the speech worker thread"""
+        if self.speech_worker_running:
             return
+
+        def speech_worker():
+            while self.speech_worker_running:
+                try:
+                    # Wait for speech requests with timeout
+                    text = self.speech_queue.get(timeout=1.0)
+                    if text and self.tts_available and gTTS is not None and pygame is not None:
+                        current_time = time.time()
+                        # Enforce cooldown to prevent overlapping speech
+                        if current_time - self.last_speech_time >= self.speech_cooldown:
+                            try:
+                                # Generate speech with Google TTS (natural female voice)
+                                tts = gTTS(text=text, lang='en', slow=False)
+
+                                # Create temporary file
+                                temp_file = os.path.join(self.temp_dir, f"speech_{int(current_time)}.mp3")
+                                tts.save(temp_file)
+
+                                # Play the audio using pygame
+                                pygame.mixer.music.load(temp_file)
+                                pygame.mixer.music.play()
+
+                                # Wait for playback to complete
+                                while pygame.mixer.music.get_busy():
+                                    time.sleep(0.1)
+
+                                # Clean up the temporary file
+                                try:
+                                    os.remove(temp_file)
+                                except OSError:
+                                    pass
+
+                                self.last_speech_time = current_time
+
+                            except Exception as e:
+                                print(f"Speech error: {e}")
+
+                    self.speech_queue.task_done()
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"Speech worker error: {e}")
+                    try:
+                        self.speech_queue.task_done()
+                    except ValueError:
+                        pass
+
+        self.speech_worker_running = True
+        worker_thread = threading.Thread(target=speech_worker, daemon=True)
+        worker_thread.start()
+        # Speech worker started (no output needed)
+
+    def speak(self, text: str):
+        if not self.tts_available or not self.speech_worker_running:
+            return
+
+        # Check cooldown before queuing
+        current_time = time.time()
+        if current_time - self.last_speech_time < self.speech_cooldown:
+            return
+
+        # Try to add speech request (non-blocking)
         try:
-            self.tts_engine.say(text)
-            self.tts_engine.runAndWait()
-        except Exception:
+            # Clear any pending speech first
+            try:
+                self.speech_queue.get_nowait()
+                self.speech_queue.task_done()
+            except queue.Empty:
+                pass
+
+            # Queue new speech
+            self.speech_queue.put_nowait(text)
+        except queue.Full:
             pass
 
     @QtCore.pyqtSlot(np.ndarray, str, float, dict)
@@ -615,22 +714,50 @@ class PostureApp(QtWidgets.QMainWindow):
         bad_ratio = info.get("bad_ratio", 0.0)
         disp = frame_bgr.copy()
 
-        # Status banner
+        # Status banner with detailed info
         is_bad = label.lower().startswith("bad")
-        chip_text = f"{label.upper()}  ({conf:.2f})  •  bad ratio {bad_ratio:.2f}"
+        angle = info.get("extras", {}).get("angle", 0)
+        chip_text = f"{label.upper()}  ({conf:.2f})  •  angle: {angle:.1f}°  •  ratio: {bad_ratio:.2f}"
         self.status_chip.setText(chip_text)
         if is_bad:
             self.status_chip.setStyleSheet("border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#c9342f;")
         else:
             self.status_chip.setStyleSheet("border-radius:22px;padding:0 18px;font-weight:600;color:white;background:#2e7d32;")
 
-        # BIG overlay if bad
-        if self.alert_enabled and bad_ratio >= self.min_bad_ratio:
-            centered_text(disp, "Bad posture — please straighten up", scale=1.1, thickness=3, color=(255,255,255), bg=(50,0,0))
-            now = time.time()
-            if self.voice_enabled and (now - self.last_alert_ts) > self.alert_cooldown:
-                self.last_alert_ts = now
+        # Track bad posture with time-based accumulation
+        current_bad_posture = bad_ratio >= self.min_bad_ratio
+        current_time = time.time()
+
+        if current_bad_posture:
+            # Start tracking bad posture time
+            if self.bad_posture_start_time is None:
+                self.bad_posture_start_time = current_time
+                print(f"🔴 Bad posture detected! Starting timer... (ratio: {bad_ratio:.3f})")
+            else:
+                # Accumulate bad posture time
+                self.bad_posture_accumulated_time += current_time - self.bad_posture_start_time
+                self.bad_posture_start_time = current_time
+
+            # Debug output every 0.5 seconds
+            if int(self.bad_posture_accumulated_time * 2) > int((self.bad_posture_accumulated_time - 0.1) * 2):
+                print(f"⏱️  Bad posture time: {self.bad_posture_accumulated_time:.1f}s / {self.voice_trigger_delay:.1f}s (voice: {self.voice_enabled}, tts: {self.tts_available})")
+
+            # Trigger voice if accumulated time exceeds threshold and enough time passed since last trigger
+            if (self.voice_enabled and self.tts_available and
+                self.bad_posture_accumulated_time >= self.voice_trigger_delay and
+                (current_time - self.last_voice_trigger_time) >= self.speech_cooldown):
+
+                print(f"🔊 TRIGGERING VOICE! Accumulated: {self.bad_posture_accumulated_time:.1f}s, Threshold: {self.voice_trigger_delay:.1f}s")
                 self.speak("You have bad posture. Please straighten up.")
+                self.last_voice_trigger_time = current_time
+                # Reset accumulation after triggering
+                self.bad_posture_accumulated_time = 0.0
+        else:
+            # Reset timing when posture is good
+            if self.bad_posture_start_time is not None:
+                print(f"✅ Good posture restored! Reset timer (was: {self.bad_posture_accumulated_time:.1f}s)")
+            self.bad_posture_start_time = None
+            self.bad_posture_accumulated_time = 0.0
 
         # Convert to QImage and paint
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
@@ -642,6 +769,16 @@ class PostureApp(QtWidgets.QMainWindow):
     def closeEvent(self, a0: Optional[QtGui.QCloseEvent]) -> None:
         try:
             self.stop_camera()
+            # Stop speech worker
+            self.speech_worker_running = False
+            # Clean up pygame and temp files
+            if hasattr(self, 'tts_available') and self.tts_available and pygame is not None:
+                pygame.mixer.quit()
+            if hasattr(self, 'temp_dir'):
+                try:
+                    shutil.rmtree(self.temp_dir)
+                except OSError:
+                    pass
         except Exception:
             pass
         if a0 is not None:
@@ -694,3 +831,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
